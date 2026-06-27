@@ -17,12 +17,14 @@ class LilithState(TypedDict):
         long_term_memories: 长期记忆列表。每条记忆是一句独立的判断句。
         affection: 好感度系统完整状态。
         llm_type: LLM 类型 ("local" / "lili")，控制使用哪个后端。
+        evolution_state: 自演化系统状态。控制演化触发、洞察累积、迭代计数等。
     """
     messages: Annotated[list, add_messages]
     persona: str
     long_term_memories: list[str]      # 长期记忆条目
     affection: dict                    # 好感度系统 (见 AFFECTION_DEFAULT)
     llm_type: str                      # "local" | "lili"
+    evolution_state: dict              # 自演化系统状态 (见 EVOLUTION_DEFAULT)
 
 
 # --- 好感度系统默认值 ---
@@ -56,4 +58,26 @@ AFFECTION_DEFAULT: dict = {
 
     # === 近期心情历史（滑动窗口） ===
     "mood_history": [],       # [{label, intensity, interaction}, ...] 最近 20 条
+}
+
+
+# --- 自演化系统默认值 ---
+
+# @evolvable: AFFECTION_DEFAULT
+EVOLUTION_DEFAULT: dict = {
+    "total_evolutions": 0,        # 总演化次数
+    "last_evolution_at": 0,       # 上次演化时的 interaction_count
+    "pending_insights": [],       # 待处理的演化洞察 [{dimension, observation, target_file, timestamp}, ...]
+    "evolution_enabled": True,    # 是否允许自演化
+    "evolution_interval": 50,     # 基础演化间隔（轮）
+    "human_likeness_score": 0.5,  # 自我评估的"人性化程度" 0~1
+    "dimension_scores": {         # 各维度人性化评分
+        "naturalness": 0.5,       # 对话自然度
+        "emotion_richness": 0.6,  # 情绪表达丰富度
+        "initiative": 0.3,        # 主动性
+        "memory_coherence": 0.4,  # 记忆连贯性
+        "personality_consistency": 0.8,  # 个性一致性
+        "error_recovery": 0.3,    # 犯错-承认-纠正
+    },
+    "evolution_journal": [],      # [{iteration, file, reason, timestamp, success}, ...] 最近 20 条
 }

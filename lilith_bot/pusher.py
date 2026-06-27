@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import os, json, time, uuid, sqlite3, random
 from typing import Optional
 import httpx
@@ -71,8 +71,12 @@ class LilithPusher:
         cid = str(uuid.uuid4())
         now_ns = int(time.time() * 1e9)
         conn = self._get_db()
-        conn.execute("INSERT INTO channel (id, user_id, name, description, data, meta, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)", (cid, uid, name, description, "null", "null", now_ns, now_ns))
-        conn.commit(); conn.close()
+        conn.execute("""
+            INSERT INTO channel (id, user_id, name, description, data, meta, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (cid, uid, name, description, "null", "null", now_ns, now_ns))
+        conn.commit()
+        conn.close()
         return cid
 
     def send_message(self, content, channel_id=None):
@@ -83,9 +87,13 @@ class LilithPusher:
         msg_id = str(uuid.uuid4())
         now_ns = int(time.time() * 1e9)
         conn = self._get_db()
-        conn.execute("INSERT INTO message (id, user_id, channel_id, content, data, meta, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)", (msg_id, uid, cid, content, "null", "null", now_ns, now_ns))
+        conn.execute("""
+            INSERT INTO message (id, user_id, channel_id, content, data, meta, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (msg_id, uid, cid, content, "null", "null", now_ns, now_ns))
         conn.execute("UPDATE channel SET updated_at=? WHERE id=?", (now_ns, cid))
-        conn.commit(); conn.close()
+        conn.commit()
+        conn.close()
         return {"id": msg_id, "content": content}
 
     send_message_stream = send_message
@@ -95,5 +103,10 @@ def get_pusher():
 
 def push_to_channel(content):
     p = get_pusher()
-    try: p.get_or_create_channel(); p.send_message(content); return True
-    except Exception as e: print("[Pusher]", e); return False
+    try:
+        p.get_or_create_channel()
+        p.send_message(content)
+        return True
+    except Exception as e:
+        print("[Pusher]", e)
+        return False

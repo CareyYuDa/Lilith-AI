@@ -8,6 +8,7 @@ Graph 结构:
 新增节点:
     update_affection: PAD实时层，基于用户消息更新情绪（无LLM）
     maybe_reflect:    条件节点，每N轮触发LLM深度反思
+    evolution:        自演化节点，AI观察自身并修改代码
 """
 
 import os
@@ -28,7 +29,7 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 
-from lilith_bot.state import LilithState, AFFECTION_DEFAULT
+from lilith_bot.state import LilithState, AFFECTION_DEFAULT, EVOLUTION_DEFAULT
 from lilith_bot.persona import (
     LILITH_SYSTEM_PROMPT, LOCAL_TOOL_HINT,
     MEMORY_SAVE_PROMPT_V2, build_system_prompt, REFLECTION_PROMPT,
@@ -39,6 +40,7 @@ from lilith_bot.affection_engine import (
     update_affection_state, mood_summary, relation_closeness,
 )
 from lilith_bot.affection_events import parse_user_message
+from lilith_bot.evolution_engine import get_evolution_engine
 
 import re
 
@@ -68,14 +70,23 @@ _THINK_PATTERN = re.compile(r"<think(?:ing)?>(.*?)</think(?:ing)?>", re.DOTALL)
 
 
 def _parse_thinking(content):
-    if not content or ("<think>" not in content and "<thinking>" not in content):
+    if not content or (
+        "<think>" not in content
+        and "<thinking>" not in content
+        and "</think>" not in content
+        and "</thinking>" not in content
+    ):
         return "", content
-    think_match = _THINK_PATTERN.search(content)
-    if think_match:
-        reasoning = think_match.group(1).strip()
-        clean = (content[:think_match.start()] + content[think_match.end():]).strip()
-        return reasoning, clean
-    return "", content
+    # 提取所有 thinking 块的内容（用 findall 而非 search，处理多个块）
+    all_reasoning = _THINK_PATTERN.findall(content)
+    reasoning = "\n\n".join(r.strip() for r in all_reasoning if r.strip())
+    # 移除所有 thinking 标签（包括 mismatched 的残留）
+    clean = _THINK_PATTERN.sub("", content).strip()
+    # 额外清理可能残留的裸标签（例如只有 </thinking> 没有 <thinking> 的情况）
+    clean = clean.replace("<thinking>", "").replace("</thinking>", "")
+    clean = clean.replace("<think>", "").replace("</think>", "")
+    clean = clean.strip()
+    return reasoning, clean
 
 
 def _apply_thinking_to_message(msg):
@@ -86,6 +97,8 @@ def _apply_thinking_to_message(msg):
     reasoning, clean_content = _parse_thinking(msg.content or '')
     if reasoning:
         msg.additional_kwargs['reasoning_content'] = reasoning
+    # 始终使用 clean_content（移除标签后的内容），即使没有提取到 reasoning
+    if clean_content != msg.content:
         msg.content = clean_content
 
 
@@ -116,7 +129,7 @@ def get_fast_llm():
             api_key=os.getenv("DEEPSEEK_API_KEY"),
             base_url=os.getenv("DEEPSEEK_BASE_URL", "https://opencode.ai/zen/go/v1"),
             temperature=0.3,
-            max_tokens=512,
+            max_tokens=4096,
         )
     return _fast_llm
 
@@ -129,7 +142,7 @@ def get_local_llm():
             api_key="not-needed",
             base_url=os.getenv("LOCAL_BASE_URL", "http://localhost:1234/v1"),
             temperature=0.8,
-            max_tokens=1024,
+            max_tokens=4096,
         )
     return _local_llm
 
@@ -142,7 +155,7 @@ def get_local_llm_with_tools():
             api_key="not-needed",
             base_url=os.getenv("LOCAL_BASE_URL", "http://localhost:1234/v1"),
             temperature=0.8,
-            max_tokens=1024,
+            max_tokens=4096,
         ).bind_tools(LANGCHAIN_TOOLS)
     return _local_llm_with_tools
 
@@ -165,7 +178,7 @@ def get_reflection_llm():
         api_key=os.getenv("DEEPSEEK_API_KEY"),
         base_url=os.getenv("DEEPSEEK_BASE_URL", "https://opencode.ai/zen/go/v1"),
         temperature=0.3,
-        max_tokens=1024,
+        max_tokens=4096,
     )
 
 
@@ -191,8 +204,8 @@ def recall_memory_node(state: LilithState):
             recalled = store.recall(user_msg, limit=5)
             memories = recalled + state.get("long_term_memories", [])
             memories = list(dict.fromkeys(memories))[:MEMORY_MAX_COUNT]
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Lilith] recall_memory failed: {type(e).__name__}: {e}")
 
     return {"long_term_memories": memories}
 
@@ -262,7 +275,7 @@ def chatbot_node(state: LilithState):
             ai_msg = AIMessage(content=result)
             return {"messages": [ai_msg]}
         except Exception as e:
-            pass
+            print(f"[Lilith] API assistant failed, falling through: {type(e).__name__}: {e}")
 
     # 正常流程: 本地模型 + 工具
     full_messages = [SystemMessage(content=system_text)] + messages
@@ -281,9 +294,23 @@ def chatbot_node(state: LilithState):
         try:
             llm = get_local_llm()
             response = llm.invoke(full_messages)
+            _apply_thinking_to_message(response)
         except Exception:
             llm = get_fast_llm()
             response = llm.invoke(full_messages)
+            _apply_thinking_to_message(response)
+
+    # 记录活动日志
+    try:
+        from lilith_bot.memory_store import get_memory_store
+        store = get_memory_store()
+        if user_msg:
+            store.add_activity("user", user_msg[:120])
+        ai_content = response.content or ""
+        if ai_content:
+            store.add_activity("lilith_chat", ai_content[:120])
+    except Exception:
+        pass
 
     return {"messages": [response]}
 
@@ -334,7 +361,8 @@ def save_memory_node(state: LilithState) -> dict:
             result_text = result_text[start:end]
 
         result = json.loads(result_text)
-    except Exception:
+    except Exception as e:
+        print(f"[Memory] save_memory json parse failed: {type(e).__name__}: {e}")
         return {}
 
     should_remember = result.get("should_remember", False)
@@ -365,13 +393,23 @@ def save_memory_node(state: LilithState) -> dict:
 
 
 def route_after_save(state: LilithState) -> str:
-    """决定是否需要深度反思"""
+    """决定是否需要深度反思 或 自演化"""
     affection = state.get("affection", AFFECTION_DEFAULT)
+    evo_state = state.get("evolution_state", dict(EVOLUTION_DEFAULT))
     count = affection.get("interaction_count", 0)
-    last = affection.get("last_reflection_at", 0)
+    last_reflection = affection.get("last_reflection_at", 0)
+    last_evolution = evo_state.get("last_evolution_at", 0)
+    evo_interval = evo_state.get("evolution_interval", 50)
+    evo_enabled = evo_state.get("evolution_enabled", True)
 
-    if count - last >= REFLECTION_INTERVAL and count > 0:
+    # 反思优先（更频繁）
+    if count - last_reflection >= REFLECTION_INTERVAL and count > 0:
         return "reflect"
+
+    # 自演化检查
+    if evo_enabled and count - last_evolution >= evo_interval and count > 0:
+        return "evolution"
+
     return "end"
 
 
@@ -455,6 +493,139 @@ def reflection_node(state: LilithState) -> dict:
     return {"affection": affection}
 
 
+
+# @evolvable: evolution_node
+def evolution_node(state: LilithState) -> dict:
+    """Self-evolution node - AI observes and modifies its own code.
+    Triggered every N interactions.
+    """
+    messages = state.get("messages", [])
+    affection = state.get("affection", dict(AFFECTION_DEFAULT))
+    evo_state = state.get("evolution_state", dict(EVOLUTION_DEFAULT))
+
+    recent = []
+    for m in messages[-12:]:
+        if hasattr(m, "type"):
+            role = "Master" if m.type == "human" else "Lilith"
+            content = m.content[:300] if m.content else ""
+            recent.append("[" + role + "] " + content)
+
+    try:
+        engine = get_evolution_engine()
+        evolvable = engine.list_evolvable_files()
+        evo_log = engine.get_evolution_log(limit=5)
+    except Exception as e:
+        print("[Evolution] Engine init failed:", e)
+        evo_state["last_evolution_at"] = affection.get("interaction_count", 0)
+        return {"evolution_state": evo_state}
+
+    files_desc = "\n".join(
+        "- " + f["name"] + ": " + f["description"] for f in evolvable
+    )
+    recent_log = "\n".join(
+        "  #" + str(r.get("iteration","?")) + ": " + str(r.get("reason","?"))[:60]
+        for r in (evo_log or [])
+    ) if evo_log else "No history"
+
+    mood = mood_summary(affection)
+    closeness = relation_closeness(affection)
+
+    analysis_prompt = (
+        "You are Lilith's self-observation module. "
+        "Analyze recent dialogue for areas to be more human-like.\n\n"
+        "Mood: " + mood + " | Relationship: " + closeness + "\n"
+        "Evolution history:\n" + recent_log + "\n\n"
+        "Recent dialogue:\n" + "\n".join(recent) + "\n\n"
+        "Files:\n" + files_desc + "\n\n"
+        "Analyze: 1.naturalness 2.emotion 3.initiative 4.memory 5.boundary\n\n"
+        'Output JSON: {"insights":[{"dimension":"","observation":"","problem":"","target_file":"","improvement":""}],"ready_to_evolve":false,"human_likeness_score":0.5}'
+    )
+
+    try:
+        llm = get_fast_llm()
+        response = llm.invoke([HumanMessage(content=analysis_prompt)])
+        result_text = response.content.strip()
+        if "{" in result_text and "}" in result_text:
+            start = result_text.index("{")
+            end = result_text.rindex("}") + 1
+            result_text = result_text[start:end]
+        analysis = json.loads(result_text)
+    except Exception as e:
+        print("[Evolution] Analysis failed:", e)
+        evo_state["last_evolution_at"] = affection.get("interaction_count", 0)
+        return {"evolution_state": evo_state}
+
+    insights = analysis.get("insights", [])
+    ready = analysis.get("ready_to_evolve", False)
+    evo_state["pending_insights"] = insights
+    evo_state["human_likeness_score"] = analysis.get(
+        "human_likeness_score", evo_state.get("human_likeness_score", 0.5))
+
+    applied_count = 0
+    if ready and insights:
+        for insight in insights[:2]:
+            target = insight.get("target_file", "")
+            improvement = insight.get("improvement", "")
+            if not target or not improvement or "." not in target:
+                continue
+
+            file_content = engine.read_self_code(target)
+            if file_content.startswith("[") and len(file_content) < 200:
+                continue
+
+            patch_prompt = (
+                "Generate a code patch for Lilith self-evolution.\n\n"
+                "Issue: " + insight.get("problem", "") + "\n"
+                "Fix: " + improvement + "\n\n"
+                "File: " + target + "\n"
+                "Content:\n```python\n" + file_content[:3000] + "\n```\n\n"
+                "Output:\n"
+                "@@ SEARCH @@\n[original]\n@@ REPLACE @@\n[new]\n@@ END @@"
+            )
+
+            try:
+                patch_llm = get_fast_llm()
+                patch_resp = patch_llm.invoke([HumanMessage(content=patch_prompt)])
+                patch_text = patch_resp.content.strip()
+                if "@@ SEARCH @@" in patch_text and "@@ REPLACE @@" in patch_text:
+                    s_idx = patch_text.index("@@ SEARCH @@")
+                    patch = patch_text[s_idx:]
+                    result = engine.apply_evolution(
+                        file_name=target, patch_content=patch,
+                        reason=improvement[:200],
+                        insight=insight.get("observation","")[:200],
+                        dry_run=True)
+                    if result.get("success") and result.get("dry_run"):
+                        result = engine.apply_evolution(
+                            file_name=target, patch_content=patch,
+                            reason=improvement[:200],
+                            insight=insight.get("observation","")[:200],
+                            dry_run=False)
+                        if result.get("success"):
+                            applied_count += 1
+                            print("[Evolution] Modified " + target)
+            except Exception as e:
+                print("[Evolution] Patch error:", e)
+
+    evo_state["total_evolutions"] = evo_state.get("total_evolutions", 0) + applied_count
+    evo_state["last_evolution_at"] = affection.get("interaction_count", 0)
+
+    journal = evo_state.get("evolution_journal", [])
+    journal.append({
+        "iteration": evo_state.get("total_evolutions", 0),
+        "interaction": affection.get("interaction_count", 0),
+        "insights_found": len(insights),
+        "applied": applied_count,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "success": applied_count > 0,
+    })
+    if len(journal) > 20:
+        journal = journal[-20:]
+    evo_state["evolution_journal"] = journal
+
+    print("[Evolution] Done:", len(insights), "insights,", applied_count, "applied")
+    return {"evolution_state": evo_state}
+
 # ============ 构建 Graph ============
 
 _tool_node = ToolNode(LANGCHAIN_TOOLS)
@@ -471,6 +642,9 @@ def build_lilith_graph() -> StateGraph:
     graph_builder.add_node("save_memory", save_memory_node)
     graph_builder.add_node("reflect", reflection_node)
 
+    # 注册节点
+    graph_builder.add_node("evolution", evolution_node)
+
     # 注册边
     graph_builder.add_edge(START, "recall_memory")
     graph_builder.add_edge("recall_memory", "update_affection")
@@ -482,9 +656,10 @@ def build_lilith_graph() -> StateGraph:
     graph_builder.add_edge("tools", "chatbot")
     graph_builder.add_conditional_edges(
         "save_memory", route_after_save,
-        {"reflect": "reflect", "end": END},
+        {"reflect": "reflect", "evolution": "evolution", "end": END},
     )
     graph_builder.add_edge("reflect", END)
+    graph_builder.add_edge("evolution", END)
 
     checkpointer = get_checkpointer()
     return graph_builder.compile(checkpointer=checkpointer)

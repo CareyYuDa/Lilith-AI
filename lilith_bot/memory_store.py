@@ -148,6 +148,18 @@ class LilithMemoryStore:
             )
         """)
 
+        # 活动日志表（短期意识流，24h 环形）
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS activity_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,          -- user | lilith_chat | lilith_channel | lilith_internal
+                summary TEXT NOT NULL,         -- LLM 压缩后的摘要（1句话）
+                detail TEXT,                   -- 原始文本（可选，调试用）
+                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                created_date TEXT NOT NULL DEFAULT (date('now'))
+            )
+        """)
+
         conn.commit()
 
     # ─── CRUD ──────────────────────────────────────────────
@@ -363,10 +375,90 @@ class LilithMemoryStore:
             self._conn.close()
             self._conn = None
 
+    # ════════════════════════════════════════════
+    # 活动日志（短期意识流）
+    # ════════════════════════════════════════════
 
-    # ═══════════════════════════════════════════════════════════
+    def add_activity(self, source: str, summary: str, detail: str = None):
+        """添加一条活动日志（LLM 压缩后存入）
+
+        Args:
+            source: user | lilith_chat | lilith_channel | lilith_internal
+            summary: LLM 压缩后的 1 句话摘要
+            detail: 原始文本（可选）
+        """
+        conn = self._get_conn()
+        conn.execute(
+            "INSERT INTO activity_log (source, summary, detail) VALUES (?, ?, ?)",
+            (source, summary[:200], detail[:500] if detail else None),
+        )
+        conn.commit()
+
+    def get_recent_activities(self, hours: int = 24, limit: int = 50) -> list:
+        """获取最近 N 小时的活动日志（含 id 用于逐条删除）"""
+        conn = self._get_conn()
+        rows = conn.execute("""
+            SELECT id, source, summary, created_at
+            FROM activity_log
+            WHERE created_at >= datetime('now', 'localtime', ?)
+            ORDER BY created_at DESC
+            LIMIT ?
+        """, (f'-{hours} hours', limit)).fetchall()
+        return [
+            {"id": r[0], "source": r[1], "summary": r[2], "time": r[3]}
+            for r in rows
+        ]
+
+    def delete_activity(self, activity_id: int) -> bool:
+        """删除单条活动日志"""
+        conn = self._get_conn()
+        conn.execute("DELETE FROM activity_log WHERE id = ?", (activity_id,))
+        conn.commit()
+        return conn.total_changes > 0
+
+    def get_activities_by_date(self, date_str: str = None) -> list:
+        """获取某天的活动日志（默认今天）"""
+        if not date_str:
+            from datetime import date
+            date_str = date.today().isoformat()
+        conn = self._get_conn()
+        rows = conn.execute("""
+            SELECT source, summary, created_at
+            FROM activity_log
+            WHERE created_date = ?
+            ORDER BY created_at DESC
+        """, (date_str,)).fetchall()
+        return [
+            {"source": r[0], "summary": r[1], "time": r[2]}
+            for r in rows
+        ]
+
+    def needs_daily_summary(self) -> bool:
+        """检查是否需要执行每日总结（日期变更）"""
+        from datetime import date
+        today = date.today().isoformat()
+        conn = self._get_conn()
+        last = conn.execute(
+            "SELECT created_date FROM activity_log ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if last is None:
+            return False  # 还没有活动
+        return last[0] != today
+
+    def clean_old_activities(self, keep_hours: int = 24):
+        """清理超过 N 小时的旧活动"""
+        conn = self._get_conn()
+        conn.execute(
+            "DELETE FROM activity_log WHERE created_at < datetime('now', 'localtime', ?)",
+            (f'-{keep_hours} hours',),
+        )
+        conn.commit()
+
+
+
+    # ════════════════════════════════════════════
     # 里程碑管理
-    # ═══════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════
 
     def add_milestone(self, milestone: str) -> bool:
         """添加关系里程碑 (去重)"""
