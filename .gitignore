@@ -1,0 +1,23 @@
+.env
+.webui_secret_key
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Runtime state
+lilith_memory.db
+lilith_memory.db-shm
+lilith_memory.db-wal
+*.sqlite
+*.sqlite3
+
+# Test/output scratch files
+test_output.txt
+temp_emb_test.txt
+
+# Local editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

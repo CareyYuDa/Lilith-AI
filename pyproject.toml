@@ -1,0 +1,35 @@
+[project]
+name = "lilith-bot"
+version = "0.1.0"
+description = "Lilith - OpenAI-compatible chat agent powered by LangGraph"
+requires-python = ">=3.10"
+readme = "README.md"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "httpx>=0.27",
+    "requests>=2.31",
+    "langgraph>=1.0",
+    "langchain>=0.3",
+    "langchain-openai>=0.3",
+    "langgraph-checkpoint-sqlite",
+    "python-dotenv>=1.0",
+    "pydantic>=2.0",
+    "sqlite-vec>=0.1.0",
+    "sentence-transformers>=3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "langgraph-cli",
+]
+desktop = [
+    "pyautogui>=0.9",
+    "pyperclip>=1.8",
+    "psutil>=5.9",
+    "pywin32>=306; platform_system == 'Windows'",
+    "pillow>=10.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["lilith_bot"]
