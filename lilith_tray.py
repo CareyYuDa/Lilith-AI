@@ -20,7 +20,7 @@ _server_proc = None
 _webui_proc = None
 
 def _create_icon():
-    """简单粉色圆形图标（和测试一样可靠）"""
+    """简单粉色圆形图标"""
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw.ellipse([4, 4, 60, 60], fill=(255, 120, 160, 255))
@@ -42,11 +42,11 @@ def _cleanup_ports():
     _kill_port(SERVER_PORT)
     _kill_port(WEBUI_PORT)
 
-def _wait_port(port, timeout=30):
+def _wait_port(port, timeout=120):
     start = time.time()
     while time.time() - start < timeout:
         try:
-            r = subprocess.run(["curl", "-s", f"http://localhost:{port}/"], capture_output=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW)
+            r = subprocess.run(["curl", "-s", f"http://localhost:{port}/"], capture_output=True, timeout=15, creationflags=subprocess.CREATE_NO_WINDOW)
             if r.returncode == 0:
                 return True
         except Exception:
@@ -58,7 +58,7 @@ def _start_services():
     global _server_proc, _webui_proc
     _cleanup_ports()
     _server_proc = subprocess.Popen([str(PYTHON_EXE), str(SERVER_SCRIPT), "--port", str(SERVER_PORT)], cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-    server_ok = _wait_port(SERVER_PORT, 20)
+    server_ok = _wait_port(SERVER_PORT, 60)
     _webui_proc = subprocess.Popen([str(OPEN_WEBUI_EXE), "serve", "--port", str(WEBUI_PORT)], cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
     webui_ok = _wait_port(WEBUI_PORT, 60)
     return server_ok, webui_ok
@@ -80,8 +80,14 @@ def _restart_services():
 def run_tray():
     import pystray
     
-    def on_open(icon):
-        webbrowser.open(f"http://localhost:{WEBUI_PORT}/")
+    DASHBOARD_URL = f"http://localhost:{SERVER_PORT}/dashboard"
+    WEBUI_URL = f"http://localhost:{WEBUI_PORT}/"
+
+    def on_open_lilith(icon):
+        webbrowser.open(WEBUI_URL)
+    
+    def on_open_dashboard(icon):
+        webbrowser.open(DASHBOARD_URL)
     
     def on_restart(icon):
         threading.Thread(target=_restart_services, daemon=True).start()
@@ -92,21 +98,22 @@ def run_tray():
     
     def on_status(icon):
         parts = []
-        parts.append("API: " + ("Running" if _server_proc and _server_proc.poll() is None else "Stopped"))
-        parts.append("WebUI: " + ("Running" if _webui_proc and _webui_proc.poll() is None else "Stopped"))
-        icon.notify("\n".join(parts), "Lilith Status")
+        parts.append("API: " + ("运行中" if _server_proc and _server_proc.poll() is None else "已停止"))
+        parts.append("WebUI: " + ("运行中" if _webui_proc and _webui_proc.poll() is None else "已停止"))
+        icon.notify("\n".join(parts), "Lilith 状态")
     
     icon = pystray.Icon(
         "lilith",
         _create_icon(),
-        "Lilith",
+        "Lilith 莉莉丝",
         menu=pystray.Menu(
-            pystray.MenuItem("Open Lilith", on_open, default=True),
+            pystray.MenuItem("打开 Lilith", on_open_lilith, default=True),
+            pystray.MenuItem("控制面板", on_open_dashboard),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Status", on_status),
-            pystray.MenuItem("Restart", on_restart),
+            pystray.MenuItem("状态", on_status),
+            pystray.MenuItem("重启服务", on_restart),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Exit", on_exit),
+            pystray.MenuItem("退出", on_exit),
         ),
     )
     
@@ -114,15 +121,15 @@ def run_tray():
     def _startup():
         try:
             server_ok, webui_ok = _start_services()
-            on_open(icon)
+            on_open_lilith(icon)
             msg = []
-            msg.append("API: " + ("Ready" if server_ok else "Timeout"))
-            msg.append("WebUI: " + ("Ready" if webui_ok else "Timeout"))
+            msg.append("API: " + ("就绪 ✓" if server_ok else "启动中..."))
+            msg.append("WebUI: " + ("就绪 ✓" if webui_ok else "启动中..."))
             time.sleep(0.5)
-            icon.notify("\n".join(msg), "Lilith Ready")
+            icon.notify("\n".join(msg), "Lilith 已就绪")
         except Exception as e:
             time.sleep(0.5)
-            try: icon.notify(f"Error: {e}", "Lilith")
+            try: icon.notify(f"错误: {e}", "Lilith")
             except Exception: pass
     
     threading.Thread(target=_startup, daemon=True).start()

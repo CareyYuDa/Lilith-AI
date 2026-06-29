@@ -1,0 +1,36 @@
+default_model = "deepseek/deepseek-v4-flash"
+[permissions]
+allow = ["Edit", "Bash(python -c \"\nwith open('server.py','r',encoding='utf-8') as f:\n    lines = f.readlines()\nfor i in range(76, 84):\n    print(f'{i+1}: {repr(lines[i])}')\")", "Bash(wc -l \"D:\\Lilith\\Lilith\\lilith_bot\\tools.py\" \"D:\\Lilith\\Lilith\\lilith_bot\\graph.py\" \"D:\\Lilith\\Lilith\\lilith_bot\\memory_store.py\" \"D:\\Lilith\\Lilith\\lilith_bot\\autonomous.py\" \"D:\\Lilith\\Lilith\\lilith_bot\\_evo_tools.py\" \"D:\\Lilith\\Lilith\\server.py\" 2>nul)", "Bash(cd \"D:\\Lilith\\Lilith\" && venv\\Scripts\\python.exe -c \"import lilith_bot.graph; print('graph.py OK')\" 2>&1)"]
+
+
+[[providers]]
+name        = "deepseek-flash"
+kind        = "openai"
+base_url    = "https://api.deepseek.com"
+model       = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+balance_url = "https://api.deepseek.com/user/balance"
+context_window = 1000000
+price       = { cache_hit = 0.02, input = 1, output = 2, currency = "¥" }
+
+[[providers]]
+name        = "deepseek-pro"
+kind        = "openai"
+base_url    = "https://api.deepseek.com"
+model       = "deepseek-v4-pro"
+api_key_env = "DEEPSEEK_API_KEY"
+balance_url = "https://api.deepseek.com/user/balance"
+context_window = 1000000
+price       = { cache_hit = 0.025, input = 3, output = 6, currency = "¥" }
+
+[[providers]]
+name        = "deepseek"
+kind        = "openai"
+base_url    = "https://api.deepseek.com"
+models      = ["deepseek-v4-flash", "deepseek-v4-pro"]
+default     = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+balance_url = "https://api.deepseek.com/user/balance"
+context_window = 1000000
+price       = { cache_hit = 0.02, input = 1, output = 2, currency = "¥" }
+prices      = { "deepseek-v4-flash" = { cache_hit = 0.02, input = 1, output = 2, currency = "¥" }, "deepseek-v4-pro" = { cache_hit = 0.025, input = 3, output = 6, currency = "¥" } }

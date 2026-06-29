@@ -3,7 +3,7 @@
 阶段三：好感度系统重构 — PAD三维情绪 + 人格特质 + 关系里程碑。
 """
 
-from typing import Annotated, TypedDict, Optional
+from typing import Annotated, TypedDict
 from langgraph.graph.message import add_messages
 
 
@@ -16,7 +16,7 @@ class LilithState(TypedDict):
         persona: 当前激活的角色设定 prompt（默认使用 LILITH_SYSTEM_PROMPT）。
         long_term_memories: 长期记忆列表。每条记忆是一句独立的判断句。
         affection: 好感度系统完整状态。
-        llm_type: LLM 类型 ("local" / "lili")，控制使用哪个后端。
+        llm_type: LLM 类型 ("local")，预留字段。
         evolution_state: 自演化系统状态。控制演化触发、洞察累积、迭代计数等。
     """
     messages: Annotated[list, add_messages]
@@ -50,7 +50,7 @@ AFFECTION_DEFAULT: dict = {
     },
 
     # === 关系里程碑 ===
-    "milestones": [],         # ["第一次一起写代码", "知道了主人的生日", ...]
+    "milestones": [],         # ["第一次一起写代码", "知道了对方的生日", ...]
 
     # === 统计 ===
     "interaction_count": 0,   # 总交互轮数

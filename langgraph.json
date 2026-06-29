@@ -1,7 +1,6 @@
 {
     "graphs": {
-        "lilith": "lilith_bot.graph:lilith_graph",
-        "lili": "lilith_bot.graph:lilith_graph"
+        "lilith": "lilith_bot.graph:lilith_graph"
     },
     "env": ".env",
     "python_version": "3.12"

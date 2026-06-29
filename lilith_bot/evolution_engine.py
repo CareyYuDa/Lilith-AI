@@ -32,6 +32,18 @@ class EvolvableFile:
     priority: int = 5
 
 EVOLVABLE_FILES: Dict[str, EvolvableFile] = {
+    "personality.py": EvolvableFile(
+        path="lilith_bot/personality.py",
+        description="结构化人格参数定义。四象限驱动力、对话行为、情感反应等可调参数。",
+        evolvable_sections=[
+            "DOMINANCE_DRIVE", "AUTONOMY_DRIVE", "BELONGING_DRIVE", "ACHIEVEMENT_DRIVE",
+            "INITIATIVE_CHANCE", "INTERRUPTION_TENDENCY", "AGREEMENT_BIAS",
+            "DEBATE_TENDENCY", "SELF_DISCLOSURE",
+            "EMOTIONAL_SENSITIVITY", "FORGIVENESS_RATE", "JEALOUSY_TENDENCY",
+        ],
+        max_change_ratio=0.15,
+        priority=10,
+    ),
     "persona.py": EvolvableFile(
         path="lilith_bot/persona.py",
         description="核心人格定义和系统提示词。",

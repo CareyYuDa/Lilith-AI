@@ -1,6 +1,11 @@
+# Environment & secrets
 .env
 .webui_secret_key
+
+# Virtual environment
 venv/
+
+# Python cache
 __pycache__/
 *.py[cod]
 *.pyo
@@ -9,8 +14,29 @@ __pycache__/
 lilith_memory.db
 lilith_memory.db-shm
 lilith_memory.db-wal
+lilith_debug.log
 *.sqlite
 *.sqlite3
+
+# Trace / debug logs
+traces/
+
+# PyInstaller build artifacts
+build/
+*.spec
+
+# Compiled executables
+Lilith.exe
+Lilith_new.exe
+
+# Stale dashboard (replaced by inline HTML)
+lilith_dashboard.html
+
+# AI assistant working directory
+.reasonix/
+
+# Evolution auto-generated logs
+evolutions/
 
 # Test/output scratch files
 test_output.txt

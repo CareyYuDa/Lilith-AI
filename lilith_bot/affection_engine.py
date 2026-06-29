@@ -1,15 +1,4 @@
-"""莉莉丝好感度引擎 — PAD情绪模型 + 衰减 + 昼夜节律 + 特质调节
-
-方案四混合架构的"实时层"：纯数学运算，无 LLM 调用，低延迟。
-
-核心机制:
-  1. PAD 三维情绪 (Pleasure-Arousal-Dominance)
-  2. 情感事件 → PAD 增量 (来自 affection_events.py)
-  3. 自然衰减 (向 baseline 回归)
-  4. 昼夜节律 (时间影响 arousal/valence)
-  5. 人格特质调节 (trait 影响事件反应强度)
-  6. PAD → 离散情绪标签映射
-"""
+"""莉莉丝好感度引擎 — PAD情绪模型 + 衰减 + 昼夜节律"""
 
 import math
 import time
@@ -34,7 +23,7 @@ CIRCADIAN_VALENCE = {
     18: 0.05, 19: 0.05, 20: 0.05, 21: 0.0, 22: 0.0, 23: 0.0,
 }
 
-# (vc, ac, dc, radius, label, emoji)
+# (valence, arousal, dominance, radius, label, emoji)
 PAD_EMOTIONS = [
     (0.8, 0.7, 0.5, 0.35, "兴奋", "ヽ(>∀<☆)ノ"),
     (0.6, 0.6, 0.3, 0.35, "开心", "(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧"),
@@ -54,6 +43,8 @@ PAD_EMOTIONS = [
     (0.3, 0.5, 0.2, 0.30, "期待", "(✧ω✧)"),
 ]
 
+
+# ============ 核心数学函数 ============
 
 def clamp(value, lo, hi):
     return max(lo, min(hi, value))
@@ -102,6 +93,7 @@ def apply_event(affection, event, traits=None):
 
 
 def compute_mood(affection):
+    """将当前 PAD 映射到最近的离散情绪标签"""
     v = affection.get("valence", 0.0) + affection.get("_circadian_dv", 0.0)
     a = affection.get("arousal", 0.0) + affection.get("_circadian_da", 0.0)
     d = affection.get("dominance", 0.0)
@@ -132,54 +124,4 @@ def update_affection_state(affection, event=None, elapsed_seconds=0.0):
     affection["mood_intensity"] = intensity
     affection["mood_emoji"] = emoji
     affection["interaction_count"] = affection.get("interaction_count", 0) + 1
-
-    history = affection.get("mood_history", [])
-    history.append({"label": label, "intensity": intensity,
-                    "interaction": affection["interaction_count"]})
-    if len(history) > 20:
-        history = history[-20:]
-    affection["mood_history"] = history
     return affection
-
-
-def mood_trend(affection):
-    history = affection.get("mood_history", [])
-    if len(history) < 3:
-        return "stable"
-    vals = [h["intensity"] for h in history[-3:]]
-    if vals[-1] > vals[0] + 0.15:
-        return "rising"
-    elif vals[-1] < vals[0] - 0.15:
-        return "falling"
-    return "stable"
-
-
-def mood_summary(affection):
-    label = affection.get("mood_label", "平静")
-    emoji = affection.get("mood_emoji", "")
-    intensity = affection.get("mood_intensity", 0.4)
-    trend = mood_trend(affection)
-
-    if intensity > 0.8:
-        adverb = "非常"
-    elif intensity > 0.5:
-        adverb = "挺"
-    else:
-        adverb = "有点"
-
-    trend_phrase = {"rising": "心情正在变好", "falling": "心情正在低落",
-                    "stable": "心情平稳"}.get(trend, "")
-    return f"{adverb}{label} {emoji}（{trend_phrase}）"
-
-
-def relation_closeness(affection):
-    count = affection.get("interaction_count", 0)
-    milestones = affection.get("milestones", [])
-    if count < 20 and len(milestones) == 0:
-        return "初识"
-    elif count < 100 or len(milestones) <= 2:
-        return "熟悉"
-    elif len(milestones) <= 5:
-        return "亲密"
-    else:
-        return "挚友"

@@ -4,7 +4,7 @@
 供 Open WebUI 作为"外部 OpenAI 连接"调用。
 
 特性:
-  - 双模型支持：lilith（本地 Qwen 9B 思维链） / lili（远程 API Agent，适合 coding）
+  - 单模型（DeepSeek Flash）：lilith（日常聊天 + 工具调用 + 思维链）
   - 完整思维链（reasoning_content）支持（通过 monkey-patch 透传）
   - LangGraph 原生 ToolNode + bind_tools 工具调用
   - 流式 & 非流式响应（统一使用 graph.stream / graph.invoke）
@@ -21,7 +21,7 @@
     设置 → 外部连接 → OpenAI API
     Base URL: http://localhost:8000/v1
     API Key: lilith-local （随便填，不做鉴权）
-    模型下拉可选: lilith / lili
+    模型: lilith
 """
 
 import os
@@ -52,15 +52,25 @@ from langchain_core.messages import HumanMessage
 
 # 必须在导入 graph 之前应用 reasoning_content 补丁（graph.py 内部已导入）
 from lilith_bot.graph import lilith_graph, DB_PATH
-from lilith_bot.persona import LILITH_SYSTEM_PROMPT
 from lilith_bot.tools import LANGCHAIN_TOOLS
 from lilith_bot.state import AFFECTION_DEFAULT
+from lilith_bot.trace_logger import set_trace_id, write_log, clear_trace_id
 
 
 # ─── 配置 ─────────────────────────────────────────────────
 THREAD_ID = "lilith-openwebui"
 MODEL_NAME = "lilith"
 LOCAL_API_KEY = "lilith-local"
+
+# ─── 调试日志文件 ────────────────────────────────────────
+_DEBUG_LOG = os.path.join(_ROOT, "lilith_debug.log")
+def debug_log(msg: str):
+    """追加写到日志文件（免去控制台查看）"""
+    try:
+        with open(_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
 
 # ─── 日志捕获器（供控制面板读取）──
 _LOG_BUFFER = []  # 环形缓冲，保存最近 80 条日志
@@ -78,10 +88,9 @@ def _captured_print(*args, **kwargs):
 print = _captured_print
 
 # API 配置（辅助请求直接调用，不走 graph）
-API_KEY = os.getenv("DEEPSEEK_API_KEY")
-BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://opencode.ai/zen/go/v1")
-CHAT_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
-REASONER_MODEL = os.getenv("DEEPSEEK_REASONER_MODEL", "deepseek-reasoner")
+API_KEY = os.getenv("LLM_API_KEY")
+BASE_URL = os.getenv("LLM_BASE_URL", "https://opencode.ai/zen/go/v1")
+CHAT_MODEL = os.getenv("LLM_CHAT_MODEL", "deepseek-v4-flash")
 
 # Open WebUI 辅助请求的特征前缀（这些请求不走对话记忆系统）
 _AUXILIARY_PREFIXES = (
@@ -93,7 +102,6 @@ _AUXILIARY_PREFIXES = (
 )
 
 TOOL_DISPLAY_NAMES = {
-    "ask_api_assistant": "API助手",
     "run_python": "Python代码",
     "run_cmd": "CMD命令",
     "screenshot": "截屏",
@@ -252,10 +260,9 @@ async def root():
     return {
         "status": "ok",
         "name": "Lilith API",
-        "models": ["lilith", "lili"],
-        "lilith_model": MODEL_NAME,
-        "lili_model": os.getenv("LILI_MODEL", "deepseek-v4"),
-        "reasoner_model": REASONER_MODEL,
+        "models": ["lilith"],
+        "model": MODEL_NAME,
+        "model": CHAT_MODEL,
         "reasoning_enabled": True,
         "tools_enabled": True,
         "tool_count": len(LANGCHAIN_TOOLS),
@@ -275,15 +282,6 @@ async def list_models():
                 "owned_by": "lilith",
                 "permission": [],
                 "root": "lilith",
-                "parent": None,
-            },
-            {
-                "id": "lili",
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "lilith",
-                "permission": [],
-                "root": "lili",
                 "parent": None,
             },
         ],
@@ -342,246 +340,80 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>莉莉丝 控制面板</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lilith Console</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#1a1a2e;color:#e0e0e0;padding:20px}
 h1{font-size:24px;margin-bottom:20px;color:#e94560}
-h2{font-size:16px;margin-bottom:10px;color:#0f3460;border-bottom:1px solid #16213e;padding-bottom:5px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
+h2{font-size:15px;margin-bottom:8px;color:#0f3460;border-bottom:1px solid #16213e;padding-bottom:5px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:16px}
 .card{background:#16213e;border-radius:10px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,.3)}
-.stat{display:flex;justify-content:space-between;padding:4px 0;font-size:13px}
+.scroll{max-height:400px;overflow-y:auto;overflow-x:hidden}
+.scroll::-webkit-scrollbar{width:4px}
+.scroll::-webkit-scrollbar-thumb{background:#0f3460;border-radius:2px}
+.stat{display:flex;justify-content:space-between;padding:3px 0;font-size:13px;cursor:pointer;border-radius:3px}
+.stat:hover{background:#1a2a4e}
 .stat .val{color:#e94560;font-weight:bold}
-.bar{height:6px;background:#0f3460;border-radius:3px;margin:4px 0;overflow:hidden}
-.bar-fill{height:100%;border-radius:3px;transition:width .5s}
-.tag{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;margin:2px;background:#0f3460}
-.thought{font-size:12px;color:#aaa;padding:3px 0;border-bottom:1px solid #1a1a2e}
-.thought:last-child{border-bottom:none}
-.log-entry{font-size:11px;color:#888;padding:2px 0;font-family:monospace;border-bottom:1px solid #1a1a2e}
-.error-log{color:#ff6b6b}
-.warn-log{color:#ffd93d}
-.ctrl-btn{background:#e94560;color:#fff;border:none;padding:6px 12px;border-radius:5px;cursor:pointer;font-size:12px}
-.ctrl-btn:hover{background:#c23152}
-.ctrl-btn.secondary{background:#0f3460}
-.ctrl-btn.secondary:hover{background:#1a5276}
-.act-row{display:flex;justify-content:space-between;align-items:center;font-size:11px;color:#888;padding:2px 0;font-family:monospace;border-bottom:1px solid #1a2a4e}
-.act-text{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.act-del{background:transparent;border:none;color:#e94560;cursor:pointer;font-size:13px;padding:0 4px;opacity:0.6}
-.act-del:hover{opacity:1}
-#refresh{position:fixed;top:20px;right:20px;background:#e94560;color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px}
-#refresh:hover{background:#c23152}
-.loading{text-align:center;padding:40px;color:#666}
+.bar{height:6px;background:#0f3460;border-radius:3px;margin:2px 0 6px;overflow:hidden}
+.bar-fill{height:100%;border-radius:3px}
+.row{display:flex;justify-content:space-between;align-items:center;font-size:12px;padding:4px 6px;border-bottom:1px solid #1a2a4e;gap:4px;cursor:pointer;border-radius:3px}
+.row:hover{background:#1a2a4e}
+.row .info{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .del{background:transparent;border:none;color:#e94560;cursor:pointer;font-size:16px;padding:0;opacity:0.6}
+.row .del:hover{opacity:1}
+.inp{background:#0f3460;border:1px solid #1a5276;color:#fff;border-radius:4px;padding:4px 8px;font-size:12px;width:100%;margin:2px 0}
+.inp:focus{outline:none;border-color:#e94560}
+.sel{background:#0f3460;border:1px solid #1a5276;color:#fff;border-radius:4px;padding:4px 8px;font-size:12px;margin:2px 0}
+#refresh{position:fixed;top:20px;right:20px;background:#e94560;color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;z-index:100}
+.ctrl-btn{background:#e94560;color:#fff;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;margin:2px}
+.ctrl-btn.s{background:#0f3460;border:1px solid #1a5276}
+.ctrl-btn.s:hover{background:#1a5276}
+[title]{text-decoration:underline 1px dotted #555}
+.tab{font-size:12px;color:#aaa;margin:6px 0 2px}
+.flex{display:flex;gap:4px;align-items:center;flex-wrap:wrap}
+.modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:200;justify-content:center;align-items:center}
+.modal-overlay.show{display:flex}
+.modal{background:#16213e;border-radius:12px;padding:24px;min-width:340px;max-width:500px;max-height:80vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,0.5)}
+.modal h3{color:#e94560;margin-bottom:12px;font-size:16px}
+.modal label{font-size:12px;color:#aaa;display:block;margin-top:8px;margin-bottom:2px}
+.modal .btns{display:flex;gap:8px;margin-top:16px;justify-content:flex-end}
 </style>
 </head>
 <body>
-<h1>🌸 莉莉丝 控制面板</h1>
-<button id="refresh" onclick="load()">⟳ 刷新</button>
-<div class="grid" id="app"></div>
-
+<h1>&#x1F338; Lilith Console</h1>
+<button id="refresh" onclick="loadData()">&#x21bb; Refresh</button>
+<div class="grid" id="app"><div class="card"><div class="loading">Loading...</div></div></div>
+<div class="modal-overlay" id="modal" onclick="if(event.target==this)closeModal()"><div class="modal" id="modalBody"></div></div>
 <script>
-async function load() {
-  const app = document.getElementById('app');
-  app.innerHTML = '<div class="loading">加载中...</div>';
-  try {
-    const r = await fetch('/dashboard/data');
-    const d = await r.json();
-    render(d);
-  } catch(e) {
-    app.innerHTML = '<div class="card" style="grid-column:1/-1;color:#ff6b6b">❌ 加载失败: ' + e.message + '</div>';
-  }
-}
-
-function render(d) {
-  const c = d.consciousness || {};
-  const aff = d.affection || {};
-  const mem = d.memory || {};
-  const brain = d.brain || {};
-  const log = d.log || [];
-
-  const cards = [];
-
-  // 1. 情绪面板
-  let moodHtml = '';
-  const moodLabel = aff.mood || aff.mood_summary || '未知';
-  const v = aff.valence != null ? aff.valence.toFixed(2) : '0.00';
-  const a = aff.arousal != null ? aff.arousal.toFixed(2) : '0.00';
-  const dom = aff.dominance != null ? aff.dominance.toFixed(2) : '0.00';
-  moodHtml += `<div class="stat"><span>心情</span><span class="val">${moodLabel}</span></div>`;
-  moodHtml += `<div class="stat"><span>愉悦度 V</span><span class="val">${v}</span></div>`;
-  moodHtml += `<div class="bar"><div class="bar-fill" style="width:${(aff.valence||0)*50+50}%;background:${aff.valence>0?'#4ecca3':'#ff6b6b'}"></div></div>`;
-  moodHtml += `<div class="stat"><span>激活度 A</span><span class="val">${a}</span></div>`;
-  moodHtml += `<div class="bar"><div class="bar-fill" style="width:${(aff.arousal||0)*50+50}%;background:#ffd93d"></div></div>`;
-  moodHtml += `<div class="stat"><span>支配度 D</span><span class="val">${dom}</span></div>`;
-  moodHtml += `<div class="bar"><div class="bar-fill" style="width:${(aff.dominance||0)*50+50}%;background:#a66cff"></div></div>`;
-  if (aff.closeness) moodHtml += `<div class="stat"><span>关系</span><span class="val">${aff.closeness}</span></div>`;
-  if (aff.interaction_count != null) moodHtml += `<div class="stat"><span>交互次数</span><span class="val">${aff.interaction_count}</span></div>`;
-  moodHtml += '<div style="margin-top:8px;display:flex;gap:4px;flex-wrap:wrap">';
-  moodHtml += '<input id="sld-v" type="range" min="-1" max="1" step="0.05" value="'+(aff.valence||0)+'" style="width:60px"> V';
-  moodHtml += '<input id="sld-a" type="range" min="-1" max="1" step="0.05" value="'+(aff.arousal||0)+'" style="width:60px"> A';
-  moodHtml += '<input id="sld-d" type="range" min="-1" max="1" step="0.05" value="'+(aff.dominance||0)+'" style="width:60px"> D';
-  moodHtml += '<button class="ctrl-btn secondary" style="font-size:11px" onclick="setAffection()">设置</button>';
-  moodHtml += '</div>';
-  cards.push({title:'💖 情绪状态', html:moodHtml});
-
-  // 2. 意识状态
-  let conHtml = '';
-  conHtml += `<div class="stat"><span>好奇心</span><span class="val">${(c.curiosity||0).toFixed(2)}</span></div>`;
-  conHtml += `<div class="stat"><span>寂寞感</span><span class="val">${(c.loneliness||0).toFixed(2)}</span></div>`;
-  conHtml += `<div class="stat"><span>精力</span><span class="val">${(c.energy||0).toFixed(2)}</span></div>`;
-  conHtml += `<div class="bar"><div class="bar-fill" style="width:${(c.energy||0)*100}%;background:#4ecca3"></div></div>`;
-  conHtml += `<div class="stat"><span>持续运行</span><span class="val">${(c.awake_seconds/60).toFixed(0)}分钟</span></div>`;
-  conHtml += `<div class="stat"><span>上次发言</span><span class="val">${c.last_spoke_at || '从未'}</span></div>`;
-  conHtml += '<div style="margin-top:8px;display:flex;gap:4px;flex-wrap:wrap">';
-  conHtml += '<input id="sld-cu" type="range" min="0" max="1" step="0.05" value="'+(c.curiosity||0)+'" style="width:55px"> 好奇';
-  conHtml += '<input id="sld-lo" type="range" min="0" max="1" step="0.05" value="'+(c.loneliness||0)+'" style="width:55px"> 寂寞';
-  conHtml += '<input id="sld-en" type="range" min="0" max="1" step="0.05" value="'+(c.energy||0)+'" style="width:55px"> 精力';
-  conHtml += '<button class="ctrl-btn secondary" style="font-size:11px" onclick="setConsciousness()">设置</button>';
-  conHtml += '<button class="ctrl-btn" style="font-size:11px" onclick="apiPost(\'/dashboard/reset-consciousness\',\'重置中...\')">重置</button>';
-  conHtml += '</div>';
-  cards.push({title:'🧠 意识状态', html:conHtml});
-
-  // 3. 思绪流
-  let thoughtHtml = '';
-  const thoughts = c.thought_buffer || [];
-  if (thoughts.length === 0) {
-    thoughtHtml = '<div class="stat" style="color:#666">暂无内心想法</div>';
-  } else {
-    thoughts.slice().reverse().forEach(t => {
-      thoughtHtml += `<div class="thought">💭 ${t.content}</div>`;
-    });
-  }
-  cards.push({title:'💭 内心独白', html:thoughtHtml});
-
-  // 4. 自主发言统计
-  let brainHtml = '';
-  const running = brain.running;
-  brainHtml += `<div class="stat"><span>运行状态</span><span class="val">${running ? '✅ 运行中' : '⏹ 已停止'}</span></div>`;
-  brainHtml += `<div class="stat"><span>总发言次数</span><span class="val">${brain.total_messages || 0}</span></div>`;
-  brainHtml += `<div class="stat"><span>发言间隔</span><span class="val">${brain.interval_range || '-'}</span></div>`;
-  if (brain.last_message) brainHtml += `<div class="stat"><span>最后发言</span><span class="val" style="font-size:11px">${brain.last_message.slice(0,40)}...</span></div>`;
-  if (brain.last_topic) brainHtml += `<div class="stat"><span>最后话题</span><span class="val">${brain.last_topic}</span></div>`;
-  brainHtml += '<div style="margin-top:10px;display:flex;gap:6px">';
-  if (running) {
-    brainHtml += '<button class="ctrl-btn" onclick="apiPost(\'/autonomous/stop\',\'停止中...\')">⏹ 停止</button>';
-  } else {
-    brainHtml += '<button class="ctrl-btn" onclick="apiPost(\'/autonomous/start\',\'启动中...\')">▶ 启动</button>';
-  }
-  brainHtml += '<button class="ctrl-btn secondary" onclick="apiPost(\'/autonomous/say\',\'思考中...\')">💬 说一句</button>';
-  brainHtml += '</div>';
-  cards.push({title:'📢 自主发言', html:brainHtml});
-
-  // 5. 记忆统计
-  let memHtml = '';
-  memHtml += `<div class="stat"><span>记忆总数</span><span class="val">${mem.total || 0}</span></div>`;
-  if (mem.by_type) {
-    Object.entries(mem.by_type).forEach(([k,v]) => {
-      const icons = {knowledge:'📖', emotional:'💕', event:'📅', skill:'🔧'};
-      memHtml += `<div class="stat"><span>${icons[k]||'•'} ${k}</span><span class="val">${v}</span></div>`;
-    });
-  }
-  cards.push({title:'📚 长期记忆', html:memHtml});
-
-  // 6. 里程碑 & 心情
-  let miscHtml = '';
-  if (mem.milestones && mem.milestones.length) {
-    miscHtml += '<div style="font-size:12px;margin-bottom:8px"><b>🏆 里程碑</b></div>';
-    mem.milestones.slice(-3).forEach(m => {
-      miscHtml += `<div class="log-entry">${m}</div>`;
-    });
-  }
-  if (mem.latest_mood) {
-    miscHtml += '<div style="font-size:12px;margin:8px 0 4px"><b>📝 最近心情</b></div>';
-    miscHtml += `<div class="log-entry">${mem.latest_mood.summary || mem.latest_mood.mood || '-'}</div>`;
-  }
-  miscHtml += '<div style="margin-top:8px;display:flex;gap:6px">';
-  miscHtml += '<button class="ctrl-btn secondary" style="font-size:11px" onclick="apiPost(\'/dashboard/force-summary\',\'总结中...\')">📋 强制每日总结</button>';
-  miscHtml += '<button class="ctrl-btn secondary" style="font-size:11px" onclick="apiPost(\'/dashboard/clear-activities\',\'清空中...\')">🗑 清空活动</button>';
-  miscHtml += '</div>';
-  if (!miscHtml) miscHtml = '<div class="stat" style="color:#666">暂无数据</div>';
-  cards.push({title:'🏆 控制', html:miscHtml});
-
-  // 7. 最近活动
-  let actHtml = '';
-  const acts = d.recent_activities || [];
-  if (acts.length === 0) {
-    actHtml = '<div class="stat" style="color:#666">暂无活动</div>';
-  } else {
-    acts.forEach(a => {
-      const emojis = {user:'💬', lilith_chat:'💭', lilith_channel:'📢', lilith_internal:'...'};
-      actHtml += `<div class="act-row"><span class="act-text">${emojis[a.source]||'•'} ${a.summary}</span><button class="act-del" onclick="deleteActivity(${a.id})">✕</button></div>`;
-    });
-  }
-  cards.push({title:'📋 近期活动 (6h)', html:actHtml});
-
-  // 8. 错误日志
-  let logHtml = '';
-  if (log.length === 0) {
-    logHtml = '<div class="stat" style="color:#666">暂无错误</div>';
-  } else {
-    log.slice(-8).reverse().forEach(l => {
-      const cls = l.includes('fail')||l.includes('错误')||l.includes('Error') ? 'error-log' : l.includes('warn') ? 'warn-log' : '';
-      logHtml += `<div class="log-entry ${cls}">${l}</div>`;
-    });
-  }
-  cards.push({title:'⚠️ 最近日志', html:logHtml});
-
-  // Render
-  app.innerHTML = cards.map(c => `
-    <div class="card">
-      <h2>${c.title}</h2>
-      ${c.html}
-    </div>
-  `).join('');
-}
-
-async function apiPost(url, loadingText) {
-  try {
-    await fetch(url, {method:'POST'});
-    load();
-  } catch(e) {
-    alert('失败: ' + e.message);
-  }
-}
-
-async function deleteActivity(id) {
-  try {
-    await fetch('/dashboard/delete-activity/' + id, {method:'POST'});
-    load();
-  } catch(e) { alert('删除失败: ' + e.message); }
-}
-
-async function setAffection() {
-  const v = parseFloat(document.getElementById('sld-v').value);
-  const a = parseFloat(document.getElementById('sld-a').value);
-  const d = parseFloat(document.getElementById('sld-d').value);
-  try {
-    await fetch('/dashboard/set-affection', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({valence: v, arousal: a, dominance: d})
-    });
-    load();
-  } catch(e) { alert('设置失败: ' + e.message); }
-}
-
-async function setConsciousness() {
-  const cu = parseFloat(document.getElementById('sld-cu').value);
-  const lo = parseFloat(document.getElementById('sld-lo').value);
-  const en = parseFloat(document.getElementById('sld-en').value);
-  try {
-    await fetch('/dashboard/set-consciousness', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({curiosity: cu, loneliness: lo, energy: en})
-    });
-    load();
-  } catch(e) { alert('设置失败: ' + e.message); }
-}
-
-load();
-// Auto refresh every 30s
-setInterval(load, 30000);
+var EDIT_DATA=null,DASH_DATA=null;
+async function loadData(){const e=document.getElementById('app');try{const t=await fetch('/dashboard/data'),n=await t.json();DASH_DATA=n;renderCards(n)}catch(t){e.innerHTML='<div class="card" style="color:#ff6b6b">Error: '+t.message+'</div>'}}
+function fmt(e){return null==e?'0.00':e.toFixed(2)}
+function bar(e,t){return'<div class="bar"><div class="bar-fill" style="width:'+((e||0)*50+50)+'%;background:'+t+'"></div></div>'}
+function renderCards(d){const e=d.affection||{},t=d.memories||[],n=d.activities||[],a=d.persons||[],i=d.log||[],r=d.personality||{},u=d.system_prompt||'',l=[];let s='';s+='<div class="stat" title="Mood"><span>Mood</span><span class="val">'+(e.mood_label||'?')+' '+(e.mood_emoji||'')+'</span></div>',s+='<div class="stat" title="Valence"><span>Valence V</span><span class="val">'+fmt(e.valence)+'</span></div>'+bar(e.valence,e.valence>0?'#4ecca3':'#ff6b6b'),s+='<div class="stat" title="Arousal"><span>Arousal A</span><span class="val">'+fmt(e.arousal)+'</span></div>'+bar(e.arousal,'#ffd93d'),s+='<div class="stat" title="Dominance"><span>Dominance D</span><span class="val">'+fmt(e.dominance)+'</span></div>'+bar(e.dominance,'#a66cff'),s+='<div class="stat"><span>Interactions</span><span class="val">'+(e.interaction_count||0)+'</span></div>',s+='<div class="flex" style="margin-top:8px">V<input id="sv" class="inp" style="width:55px" type="number" step="0.05" min="-1" max="1" value="'+(e.valence||0).toFixed(2)+'">A<input id="sa" class="inp" style="width:55px" type="number" step="0.05" min="-1" max="1" value="'+(e.arousal||0).toFixed(2)+'">D<input id="sd" class="inp" style="width:55px" type="number" step="0.05" min="-1" max="1" value="'+(e.dominance||0).toFixed(2)+'"><button class="ctrl-btn s" onclick="setAff()">Set</button></div>',l.push({title:'Emotion',html:s}),
+s='<div class="stat" onclick="editPrompt()" style="cursor:pointer;color:#a66cff" title="Click to edit the system prompt">&#x2699; Edit System Prompt (worldview &amp; personality) <span style="float:right">&#x270E;</span></div><div style="font-size:11px;color:#666;margin-top:4px;padding:6px;background:#0f3460;border-radius:4px;max-height:120px;overflow-y:auto">'+(u||'').slice(0,200)+'...</div>',l.push({title:'Prompt',html:s}),s='<div class="scroll">';if(r.drives){s+='<div class="tab">Drives:</div>';for(const[e,t]of Object.entries(r.drives)){const n={dominance:'Dominance',autonomy:'Autonomy',belonging:'Belonging',achievement:'Achievement'};s+='<div class="stat" onclick="editDrive(\''+e+'\','+t.toFixed(2)+')" title="Click to edit"><span>'+(n[e]||e)+'</span><span class="val">'+t.toFixed(2)+'</span></div>'}}if(r.behavior){s+='<div class="tab">Behavior:</div>';for(const[e,t]of Object.entries(r.behavior))s+='<div class="stat" onclick="editBehavior(\''+e+'\','+t.toFixed(2)+')" title="Click to edit"><span>'+e+'</span><span class="val">'+t.toFixed(2)+'</span></div>'}if(r.emotion){s+='<div class="tab">Emotion:</div>';for(const[e,t]of Object.entries(r.emotion))s+='<div class="stat" onclick="editEmotion(\''+e+'\','+t.toFixed(2)+')" title="Click to edit"><span>'+e+'</span><span class="val">'+t.toFixed(2)+'</span></div>'}s||(s='<div class="stat" style="color:#666">No data</div>'),s+='</div>',l.push({title:'Personality',html:s}),s='<div class="scroll">',0===a.length?s='<div class="stat" style="color:#666">No persons</div>':a.forEach(e=>{s+='<div class="row" onclick="editPerson(\''+e.name+'\','+e.trust+','+e.intimacy+',\''+(e.portrait||'')+'\')" title="Click to edit"><span class="info"><b>'+e.name+'</b> trust:'+e.trust.toFixed(2)+' intm:'+e.intimacy.toFixed(2)+' ('+e.interactions+'x)</span></div>'}),s+='</div>',l.push({title:'Persons ('+a.length+')',html:s}),s='<div class="scroll">',0===t.length?s='<div class="stat" style="color:#666">No memories</div>':(t.forEach(e=>{let n=e.content;n.length>55&&(n=n.slice(0,55)+'..');const a={knowledge:'KN',emotional:'EM',event:'EV',skill:'SK',daily_summary:'SUM'};s+='<div class="row" onclick="editMemory('+e.id+',\''+(e.content||'').replace(/\x27/g,' ')+'\',\''+(e.type||'knowledge')+'\','+e.importance.toFixed(2)+',\''+(e.person||'')+'\')" title="Click to edit"><span class="info">['+(a[e.type]||e.type)+'] '+n+' <span style="color:#888">'+e.importance.toFixed(1)+'</span></span><button class="del" onclick="event.stopPropagation();delMem('+e.id+')">x</button></div>'}),s+='</div>'),l.push({title:'Memories ('+t.length+')',html:s}),s='<div class="scroll">',0===n.length?s='<div class="stat" style="color:#666">No activity</div>':(n.forEach(e=>{const t=e.person?e.person+': ':'',n=(e.summary||'').slice(0,50);s+='<div class="row" onclick="editActivity('+e.id+',\''+(e.summary||'').replace(/\x27/g,' ')+'\',\''+(e.source||'')+'\',\''+(e.person||'')+'\')" title="Click to edit"><span class="info">'+t+n+'</span><button class="del" onclick="event.stopPropagation();delAct('+e.id+')">x</button></div>'}),s+='<div style="margin-top:8px"><button class="ctrl-btn s" onclick="clearActs()">Clear All</button></div>'),s+='</div>',l.push({title:'Activity',html:s}),s='<div class="scroll">',0===i.length?s='<div class="stat" style="color:#666">No log</div>':(()=>{const e=Math.max(0,i.length-15);for(let t=i.length-1;t>=e;t--)s+='<div style="font-size:11px;font-family:monospace;color:#888;padding:2px 0;border-bottom:1px solid #1a2a4e">'+(i[t]||'').slice(0,70)+'</div>'})() ,s+='</div>',l.push({title:'System Log',html:s});let o='';for(let e=0;e<l.length;e++)o+='<div class="card"><h2>'+l[e].title+'</h2>'+l[e].html+'</div>';document.getElementById('app').innerHTML=o}
+function showModal(e,t){document.getElementById('modalBody').innerHTML='<h3>'+e+'</h3>'+t+'<div class="btns"><button class="ctrl-btn s" onclick="closeModal()">Cancel</button></div>',document.getElementById('modal').classList.add('show')}
+function closeModal(){document.getElementById('modal').classList.remove('show')}
+function saveModal(e,t){fetch(e,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(t)}).then(()=>{closeModal();loadData()})}
+function editDrive(e,t){showModal('Edit Drive: '+e,'<label>Value (0~1)</label><input id="me-val" class="inp" type="number" step="0.01" min="0" max="1" value="'+t.toFixed(2)+'"><div class="btns"><button class="ctrl-btn" onclick="saveDrive(\''+e+'\')">Save</button></div>')}
+function saveDrive(e){saveModal('/dashboard/set-personality',{section:'drives',key:e,value:parseFloat(document.getElementById('me-val').value)})}
+function editBehavior(e,t){showModal('Edit Behavior: '+e,'<label>Value (0~1)</label><input id="me-val" class="inp" type="number" step="0.01" min="0" max="1" value="'+t.toFixed(2)+'"><div class="btns"><button class="ctrl-btn" onclick="saveBehavior(\''+e+'\')">Save</button></div>')}
+function saveBehavior(e){saveModal('/dashboard/set-personality',{section:'behavior',key:e,value:parseFloat(document.getElementById('me-val').value)})}
+function editEmotion(e,t){showModal('Edit Emotion: '+e,'<label>Value (0~1)</label><input id="me-val" class="inp" type="number" step="0.01" min="0" max="1" value="'+t.toFixed(2)+'"><div class="btns"><button class="ctrl-btn" onclick="saveEmotion(\''+e+'\')">Save</button></div>')}
+function saveEmotion(e){saveModal('/dashboard/set-personality',{section:'emotion',key:e,value:parseFloat(document.getElementById('me-val').value)})}
+function editPerson(e,t,n,a){showModal('Edit Person: '+e,'<label>Name</label><input id="me-name" class="inp" value="'+(e||'')+'"><label>Portrait</label><input id="me-portrait" class="inp" value="'+(a||'')+'"><label>Trust (0~1)</label><input id="me-trust" class="inp" type="number" step="0.01" min="0" max="1" value="'+t.toFixed(2)+'"><label>Intimacy (0~1)</label><input id="me-intm" class="inp" type="number" step="0.01" min="0" max="1" value="'+n.toFixed(2)+'"><div class="btns"><button class="ctrl-btn" onclick="savePerson(\''+e+'\')">Save</button></div>')}
+function savePerson(e){const t={orig_name:e,person_name:document.getElementById('me-name').value,portrait:document.getElementById('me-portrait').value,trust:parseFloat(document.getElementById('me-trust').value),intimacy:parseFloat(document.getElementById('me-intm').value)};saveModal('/dashboard/set-person',t)}
+function editPrompt(){showModal('Edit System Prompt','<label>世界观/人格提示词</label><textarea id="me-prompt" class="inp" style="height:300px;font-size:12px;font-family:monospace">'+(DASH_DATA.system_prompt||'').replace(/`/g,'&#x60;').replace(/\$/g,'&#36;')+'</textarea><div class="btns"><button class="ctrl-btn" onclick="savePrompt()">Save</button></div>')}
+function savePrompt(){saveModal('/dashboard/set-system-prompt',{prompt:document.getElementById('me-prompt').value})}
+function editMemory(e,t,n,a,i){showModal('Edit Memory #'+e,'<label>Content</label><textarea id="me-content" class="inp" rows="3">'+(t||'')+'</textarea><label>Type</label><select id="me-type" class="sel"><option value="knowledge"'+(n=='knowledge'?' selected':'')+'>Knowledge</option><option value="emotional"'+(n=='emotional'?' selected':'')+'>Emotional</option><option value="event"'+(n=='event'?' selected':'')+'>Event</option><option value="skill"'+(n=='skill'?' selected':'')+'>Skill</option><option value="daily_summary"'+(n=='daily_summary'?' selected':'')+'>Daily Summary</option></select><label>Importance (0~1)</label><input id="me-imp" class="inp" type="number" step="0.1" min="0" max="1" value="'+a.toFixed(1)+'"><label>Person</label><input id="me-person" class="inp" value="'+(i||'对方')+'"><div class="btns"><button class="ctrl-btn" onclick="saveMemory('+e+')">Save</button></div>')}
+function saveMemory(e){const t={content:document.getElementById('me-content').value,type:document.getElementById('me-type').value,importance:parseFloat(document.getElementById('me-imp').value),person:document.getElementById('me-person').value};saveModal('/dashboard/set-memory/'+e,t)}
+function editActivity(e,t,n,a){showModal('Edit Activity #'+e,'<label>Summary</label><input id="me-summary" class="inp" value="'+(t||'')+'"><label>Source</label><select id="me-source" class="sel"><option value="user"'+(n=='user'?' selected':'')+'>User</option><option value="lilith_chat"'+(n=='lilith_chat'?' selected':'')+'>Lilith</option><option value="lilith_channel"'+(n=='lilith_channel'?' selected':'')+'>Channel</option><option value="lilith_internal"'+(n=='lilith_internal'?' selected':'')+'>Internal</option></select><label>Person</label><input id="me-person" class="inp" value="'+(a||'')+'"><div class="btns"><button class="ctrl-btn" onclick="saveActivity('+e+')">Save</button></div>')}
+function saveActivity(e){const t={summary:document.getElementById('me-summary').value,source:document.getElementById('me-source').value,person:document.getElementById('me-person').value};saveModal('/dashboard/set-activity/'+e,t)}
+async function setAff(){try{await fetch('/dashboard/set-affection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({valence:parseFloat(document.getElementById('sv').value),arousal:parseFloat(document.getElementById('sa').value),dominance:parseFloat(document.getElementById('sd').value)})});loadData()}catch(e){}}
+async function delMem(e){try{await fetch('/dashboard/delete-memory/'+e,{method:'POST'});loadData()}catch(e){}}
+async function delAct(e){try{await fetch('/dashboard/delete-activity/'+e,{method:'POST'});loadData()}catch(e){}}
+async function clearActs(){try{await fetch('/dashboard/clear-activities',{method:'POST'});loadData()}catch(e){}}
+loadData();setInterval(loadData,30000);
 </script>
 </body>
 </html>"""
@@ -606,29 +438,21 @@ async def dashboard_data():
         state = lilith_graph.get_state(config)
         aff = state.values.get("affection", {}) if state and state.values else {}
         if aff:
-            from lilith_bot.affection_engine import mood_summary, relation_closeness
             data["affection"] = {
                 "valence": aff.get("valence"),
                 "arousal": aff.get("arousal"),
                 "dominance": aff.get("dominance"),
-                "mood_summary": mood_summary(aff),
-                "closeness": relation_closeness(aff),
+                "mood_label": aff.get("mood_label", "未知"),
+                "mood_emoji": aff.get("mood_emoji", ""),
                 "interaction_count": aff.get("interaction_count", 0),
-                "mood": aff.get("current_mood", ""),
             }
     except Exception as e:
         data["affection"] = {"error": str(e)}
 
-    # 2. 意识状态
+    # 2. 自主发言状态
     try:
         from lilith_bot.autonomous import get_autonomous_brain
         brain = get_autonomous_brain()
-        data["consciousness"] = brain.consciousness.to_dict()
-    except Exception as e:
-        data["consciousness"] = {"error": str(e)}
-
-    # 3. 自主发言状态
-    try:
         data["brain"] = brain.status()
     except Exception:
         data["brain"] = {}
@@ -643,15 +467,51 @@ async def dashboard_data():
     except Exception as e:
         data["memory"] = {"error": str(e)}
 
-    # 5. 最近活动
+    # 5. 长期记忆列表
     try:
         from lilith_bot.memory_store import get_memory_store
         store = get_memory_store()
-        data["recent_activities"] = store.get_recent_activities(hours=6, limit=20)
-    except Exception:
-        data["recent_activities"] = []
+        all_mems = store.get_all_memories()
+        data["memories"] = [{
+            "id": m["id"], "content": m["content"],
+            "type": m["type"], "importance": m["importance"],
+            "person": m.get("person", "对方"),
+            "created_at": m.get("created_at", ""),
+        } for m in all_mems]
+    except Exception as e:
+        data["memories"] = []
 
-    # 6. 错误日志
+    # 6. 人物认知
+    try:
+        from lilith_bot.memory_store import get_memory_store
+        store = get_memory_store()
+        data["persons"] = store.list_known_persons()
+    except Exception:
+        data["persons"] = []
+
+    # 7. 人格参数
+    try:
+        from lilith_bot.personality import get_personality_summary
+        data["personality"] = get_personality_summary()
+    except Exception:
+        data["personality"] = {}
+
+    # 8. 最近活动
+    try:
+        from lilith_bot.memory_store import get_memory_store
+        store = get_memory_store()
+        data["activities"] = store.get_recent_activities(hours=6, limit=20)
+    except Exception:
+        data["activities"] = []
+
+    # 9. System Prompt（当前世界观/人格文本）
+    try:
+        from lilith_bot.persona import LILITH_SYSTEM_PROMPT
+        data["system_prompt"] = LILITH_SYSTEM_PROMPT
+    except Exception:
+        data["system_prompt"] = ""
+
+    # 10. 错误日志
     with _LOG_LOCK:
         log_entries = list(_LOG_BUFFER)
     data["log"] = log_entries
@@ -724,20 +584,119 @@ async def dashboard_clear_activities():
 
 
 @app.post("/dashboard/reset-consciousness")
-async def dashboard_reset_consciousness():
-    """重置意识状态"""
+
+@app.post("/dashboard/set-personality")
+async def dashboard_set_personality(request: Request):
+    data = await request.json()
     try:
-        from lilith_bot.autonomous import get_autonomous_brain, ConsciousnessState
-        brain = get_autonomous_brain()
-        brain.consciousness = ConsciousnessState(
-            created_at=time.time(),
-            last_interaction_at=time.time(),
+        import lilith_bot.personality as p
+        section = data.get("section")
+        key = data.get("key")
+        value = data.get("value")
+        if section and key and value is not None:
+            mapping = {
+                "drives": {"dominance":"DOMINANCE_DRIVE","autonomy":"AUTONOMY_DRIVE","belonging":"BELONGING_DRIVE","achievement":"ACHIEVEMENT_DRIVE"},
+                "behavior": {"initiative":"INITIATIVE_CHANCE","interruption":"INTERRUPTION_TENDENCY","agreement":"AGREEMENT_BIAS","debate":"DEBATE_TENDENCY","self_disclosure":"SELF_DISCLOSURE"},
+                "emotion": {"sensitivity":"EMOTIONAL_SENSITIVITY","forgiveness":"FORGIVENESS_RATE","jealousy":"JEALOUSY_TENDENCY"},
+            }
+            const_name = mapping.get(section, {}).get(key)
+            if const_name and hasattr(p, const_name):
+                setattr(p, const_name, max(0.0, min(1.0, float(value))))
+                return {"success": True, "updated": f"{const_name}={value}"}
+        return {"success": False, "error": "Invalid params"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/dashboard/set-system-prompt")
+async def dashboard_set_system_prompt(request: Request):
+    """修改世界观/人格提示词"""
+    try:
+        body = await request.json()
+        prompt = body.get("prompt", "")
+        if not prompt or len(prompt) < 10:
+            return {"success": False, "error": "Prompt too short"}
+        import lilith_bot.persona as persona
+        persona.LILITH_SYSTEM_PROMPT = prompt
+        # 写回文件持久化
+        import re
+        path = os.path.join(_ROOT, "lilith_bot", "persona.py")
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        # 替换 LILITH_SYSTEM_PROMPT 的内容（保留引号和等号）
+        new_content = re.sub(
+            r'(LILITH_SYSTEM_PROMPT\s*=\s*""").*?(""")',
+            lambda m: m.group(1) + prompt + m.group(2),
+            content,
+            flags=re.DOTALL,
         )
-        print("[Dashboard] 意识状态已重置")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        return {"success": True, "length": len(prompt)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/dashboard/delete-person")
+async def dashboard_delete_person(request: Request):
+    try:
+        data = await request.json()
+        name = data.get("name", "")
+        if not name:
+            return {"success": False, "error": "Name required"}
+        from lilith_bot.memory_store import get_memory_store
+        store = get_memory_store()
+        conn = store._get_conn()
+        conn.execute("DELETE FROM person_knowledge WHERE person_name = ?", (name,))
+        conn.commit()
         return {"success": True}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+@app.post("/dashboard/set-person")
+async def dashboard_set_person(request: Request):
+    data = await request.json()
+    try:
+        from lilith_bot.memory_store import get_memory_store
+        store = get_memory_store()
+        name = data.get("person_name", "").strip()
+        orig = data.get("orig_name", name)
+        if not name:
+            return {"success": False, "error": "Name required"}
+        if orig and orig != name:
+            conn = store._get_conn()
+            conn.execute("DELETE FROM person_knowledge WHERE person_name = ?", (orig,))
+            conn.commit()
+        store.add_or_update_person_knowledge(person_name=name, portrait=data.get("portrait",""), trust=float(data.get("trust",0.5)), intimacy=float(data.get("intimacy",0.3)))
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/dashboard/set-memory/{memory_id}")
+async def dashboard_set_memory(memory_id: int, request: Request):
+    data = await request.json()
+    try:
+        from lilith_bot.memory_store import get_memory_store
+        store = get_memory_store()
+        conn = store._get_conn()
+        conn.execute("UPDATE memories SET content=?, memory_type=?, importance=?, person=? WHERE id=?", (data.get("content",""), data.get("type","knowledge"), float(data.get("importance",0.5)), data.get("person",""), memory_id))
+        conn.commit()
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/dashboard/set-activity/{activity_id}")
+async def dashboard_set_activity(activity_id: int, request: Request):
+    data = await request.json()
+    try:
+        from lilith_bot.memory_store import get_memory_store
+        store = get_memory_store()
+        conn = store._get_conn()
+        conn.execute("UPDATE activity_log SET summary=?, source=?, person=? WHERE id=?", (data.get("summary",""), data.get("source","user"), data.get("person",""), activity_id))
+        conn.commit()
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 @app.post("/dashboard/force-summary")
 async def dashboard_force_summary():
@@ -763,27 +722,10 @@ async def dashboard_force_summary():
         return {"success": False, "error": str(e)}
 
 
-@app.post("/dashboard/set-consciousness")
-async def dashboard_set_consciousness(request: Request):
-    """手动设置意识状态数值"""
-    body = await request.json()
-    try:
-        from lilith_bot.autonomous import get_autonomous_brain
-        brain = get_autonomous_brain()
-        c = brain.consciousness
-        for key in ("curiosity", "loneliness", "energy"):
-            if key in body:
-                setattr(c, key, max(0.0, min(1.0, float(body[key]))))
-        print(f"[Dashboard] 意识状态已调整: {body}")
-        return {"success": True}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-# ─── 聊天核心 ─────────────────────────────────────────────
-
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    # ── 全链路追踪：生成 trace_id ──
+    trace_id = set_trace_id()
     body = await request.json()
     messages = body.get("messages", [])
     stream = body.get("stream", False)
@@ -792,7 +734,16 @@ async def chat_completions(request: Request):
     # 提取最后一条用户消息
     user_msg = _extract_last_user_message(messages)
 
+    # 记录 API 入口
+    write_log("api_entry", {
+        "user_msg": user_msg[:200],
+        "stream": stream,
+        "model": model,
+        "message_count": len(messages),
+    })
+
     if not user_msg:
+        clear_trace_id()
         return JSONResponse(
             {"error": {"message": "No user message found", "type": "invalid_request_error"}},
             status_code=400,
@@ -800,10 +751,14 @@ async def chat_completions(request: Request):
 
     # ── 辅助请求检测 ──
     if _is_auxiliary_request(user_msg, messages):
+        write_log("api_entry", {"auxiliary": True, "user_msg": user_msg[:200]})
+        clear_trace_id()
         return _call_auxiliary(messages, stream)
 
     # 特殊命令
     if user_msg.strip().lower() == "/reset":
+        write_log("api_entry", {"reset": True})
+        clear_trace_id()
         if stream:
             return _stream_simple("莉莉丝: 对话已重置~ 莉莉丝会忘了之前的事哦 (´･ω･`)", model)
         return _make_response("莉莉丝: 对话已重置~ 莉莉丝会忘了之前的事哦 (´･ω･`)", model)
@@ -814,10 +769,10 @@ async def chat_completions(request: Request):
     # 构建 graph 输入（只传新消息，checkpoint 自动保留历史）
     state_in = {
         "messages": [HumanMessage(content=user_msg)],
-        "persona": LILITH_SYSTEM_PROMPT,
+        "persona": "莉莉丝（Lilith）System Prompt（待SubconsciousEngine重构）",
         "long_term_memories": sv.get("long_term_memories", []),
         "affection": sv.get("affection", AFFECTION_DEFAULT),
-        "llm_type": "lili" if model == "lili" else "local",
+        "llm_type": "local",
     }
 
     if stream:
@@ -839,7 +794,7 @@ def _stream_graph_response(state_in: dict, config: dict, model: str):
     created = int(time.time())
 
     def _chunk(reasoning: str, content: str, finish: str = None):
-        delta = {}
+        delta = {"role": "assistant"}
         if reasoning:
             delta["reasoning_content"] = reasoning
         if content:
@@ -944,70 +899,88 @@ def _stream_graph_response(state_in: dict, config: dict, model: str):
 
     def generate():
         nonlocal _think_buf
+        # 每次流式请求先清空旧日志
+        try:
+            open(_DEBUG_LOG, "w", encoding="utf-8").close()
+        except Exception:
+            pass
+        debug_log("=== 新请求 ===")
+
         # 发送初始空 chunk（触发 Open WebUI 开始接收）
         stream_start = time.time()
         stream_timeout = 180.0
-        # send initial empty chunk (triggers Open WebUI to start receiving)
         yield f"data: {json.dumps(_chunk('', ''), ensure_ascii=False)}\n\n"
 
         full_response = ""
 
         # 使用 graph.stream 同步流式输出（SqliteSaver 不支持异步）
-        for msg_chunk, metadata in lilith_graph.stream(
-            state_in, config, stream_mode="messages"
-        ):
-            node = metadata.get("langgraph_node", "")
+        try:
+            for msg_chunk, metadata in lilith_graph.stream(
+                state_in, config, stream_mode="messages"
+            ):
+                node = metadata.get("langgraph_node", "")
 
-            # ToolMessage 来自 tools 节点：输出工具完成提示（必须在 chatbot 过滤之前）
-            if time.time() - stream_start > stream_timeout:
-                print("[Lilith] Streaming response timed out (180s), aborting")
-                break
-            chunk_type_name = type(msg_chunk).__name__
-            if "ToolMessage" in chunk_type_name:
-                tool_done_hint = '\n✅ 工具调用完成\n\n'
-                yield f"data: {json.dumps(_chunk('', tool_done_hint), ensure_ascii=False)}\n\n"
-                continue
-            if "AIMessage" not in chunk_type_name:
-                continue
+                # ToolMessage 来自 tools 节点：输出工具完成提示（必须在 chatbot 过滤之前）
+                if time.time() - stream_start > stream_timeout:
+                    print("[Lilith] Streaming response timed out (180s), aborting")
+                    break
+                chunk_type_name = type(msg_chunk).__name__
+                if "ToolMessage" in chunk_type_name:
+                    # 记录工具执行结果
+                    tool_content = getattr(msg_chunk, "content", "") or ""
+                    write_log("tool_call", {"result": tool_content[:300]})
+                    tool_done_hint = '\n✅ 工具调用完成\n\n'
+                    yield f"data: {json.dumps(_chunk('', tool_done_hint), ensure_ascii=False)}\n\n"
+                    continue
+                if "AIMessage" not in chunk_type_name:
+                    continue
 
-            # 工具调用：输出提示信息给用户
-            tool_calls = getattr(msg_chunk, "tool_calls", None)
-            if tool_calls:
-                for tc in tool_calls:
-                    if isinstance(tc, dict):
-                        tool_name = tc.get("name", "unknown")
-                    else:
-                        tool_name = getattr(tc, "name", "unknown")
-                    friendly = TOOL_DISPLAY_NAMES.get(tool_name, tool_name)
-                    hint = f"\n\n🔧 莉莉丝正在调用工具: {friendly}...\n\n"
-                    yield f"data: {json.dumps(_chunk('', hint), ensure_ascii=False)}\n\n"
-                continue
+                # 工具调用：输出提示信息给用户 + 记录日志
+                tool_calls = getattr(msg_chunk, "tool_calls", None)
+                if tool_calls:
+                    tool_log = []
+                    for tc in tool_calls:
+                        if isinstance(tc, dict):
+                            tool_name = tc.get("name", "unknown")
+                            tool_args = tc.get("args", {})
+                        else:
+                            tool_name = getattr(tc, "name", "unknown")
+                            tool_args = getattr(tc, "args", {})
+                        tool_log.append({"name": tool_name, "args": tool_args})
+                        friendly = TOOL_DISPLAY_NAMES.get(tool_name, tool_name)
+                        hint = f"\n\n🔧 莉莉丝正在调用工具: {friendly}...\n\n"
+                        yield f"data: {json.dumps(_chunk('', hint), ensure_ascii=False)}\n\n"
+                    write_log("tool_call", {"tools": tool_log})
+                    continue
 
-            # 提取 reasoning_content（来自 monkey-patch 透传）
-            api_reasoning = ""
-            if hasattr(msg_chunk, "additional_kwargs") and msg_chunk.additional_kwargs:
-                api_reasoning = msg_chunk.additional_kwargs.get("reasoning_content", "")
+                # 提取 reasoning_content（来自 monkey-patch 透传）
+                api_reasoning = ""
+                if hasattr(msg_chunk, "additional_kwargs") and msg_chunk.additional_kwargs:
+                    api_reasoning = msg_chunk.additional_kwargs.get("reasoning_content", "")
 
-            content = getattr(msg_chunk, "content", "") or ""
+                content = getattr(msg_chunk, "content", "") or ""
 
-            # API 原生 reasoning_content 优先发送
-            if api_reasoning:
-                yield f"data: {json.dumps(_chunk(api_reasoning, ''), ensure_ascii=False)}\n\n"
-                # 原生 reasoning 的 chunk 也可能有 content，继续处理
+                # API 原生 reasoning_content 优先发送
+                if api_reasoning:
+                    yield f"data: {json.dumps(_chunk(api_reasoning, ''), ensure_ascii=False)}\n\n"
 
-            # 检查 content 中是否有 thinking 标签
-            if "<think" in content or _think_buf:
-                for emit_type, emit_text in _emit_think_chunks(content):
-                    if emit_type == "reasoning" and emit_text.strip():
-                        yield f"data: {json.dumps(_chunk(emit_text.strip(), ''), ensure_ascii=False)}\n\n"
-                    elif emit_type == "content" and emit_text:
-                        full_response += emit_text
-                        yield f"data: {json.dumps(_chunk('', emit_text), ensure_ascii=False)}\n\n"
-            else:
-                # 普通文本，直接发送
-                if content:
-                    full_response += content
-                    yield f"data: {json.dumps(_chunk('', content), ensure_ascii=False)}\n\n"
+                # 检查 content 中是否有 thinking 标签
+                if "<think" in content or _think_buf:
+                    for emit_type, emit_text in _emit_think_chunks(content):
+                        if emit_type == "reasoning" and emit_text.strip():
+                            yield f"data: {json.dumps(_chunk(emit_text.strip(), ''), ensure_ascii=False)}\n\n"
+                        elif emit_type == "content" and emit_text:
+                            full_response += emit_text
+                            yield f"data: {json.dumps(_chunk('', emit_text), ensure_ascii=False)}\n\n"
+                else:
+                    if content:
+                        full_response += content
+                        yield f"data: {json.dumps(_chunk('', content), ensure_ascii=False)}\n\n"
+
+        except Exception as e:
+            print(f"[Lilith] Stream error: {type(e).__name__}: {e}")
+            err_text = "\n\n[Error: " + type(e).__name__ + "]"
+            yield f"data: {json.dumps(_chunk('', err_text), ensure_ascii=False)}\n\n"
 
         # 处理缓冲区中残留的内容
         if _think_buf:
@@ -1021,6 +994,12 @@ def _stream_graph_response(state_in: dict, config: dict, model: str):
         # 结束标记
         yield f"data: {json.dumps(_chunk('', '', 'stop'), ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
+
+        # 记录 LLM 完整输出
+        write_log("llm_output", {"content": full_response[:500], "content_length": len(full_response)})
+
+        # 清空 trace_id
+        clear_trace_id()
 
     return StreamingResponse(
         generate(),
@@ -1041,8 +1020,15 @@ async def _sync_graph_response(state_in: dict, config: dict, model: str):
         )
     except asyncio.TimeoutError:
         print('[Lilith] Graph invoke timed out (120s), returning fallback')
+        write_log("llm_output", {"error": "timeout", "timeout": 120})
+        clear_trace_id()
         fallback = "\u5410\u5410\u2026\u66f4\u65b0\u8fc7\u4e8e\u6162\u4e86\uff0c\u518d\u7b49\u7b49\u5427~"
         return _make_response(fallback, model)
+    except Exception as e:
+        print(f'[Lilith] Graph invoke error: {type(e).__name__}: {e}')
+        write_log("llm_output", {"error": type(e).__name__, "msg": str(e)[:200]})
+        clear_trace_id()
+        return _make_response(f"抱歉，出了点问题: {type(e).__name__}", model)
 
     content = ""
     reasoning = ""
@@ -1054,6 +1040,8 @@ async def _sync_graph_response(state_in: dict, config: dict, model: str):
                     reasoning = m.additional_kwargs.get("reasoning_content", "")
                 break
 
+    write_log("llm_output", {"content": content[:500], "content_length": len(content)})
+    clear_trace_id()
     return _make_response_with_reasoning(content, reasoning, model)
 
 
@@ -1158,8 +1146,7 @@ if __name__ == "__main__":
 
     print(f"[Lilith] 🌸 API 服务器启动中... (v0.4.0 LangGraph 原生工具系统)")
     print(f"[Lilith]    地址: http://{args.host}:{args.port}")
-    print(f"[Lilith]    模型: {MODEL_NAME} / lili")
-    print(f"[Lilith]    思维链引擎: {REASONER_MODEL}")
+    print(f"[Lilith]    模型: {CHAT_MODEL}")
     print(f"[Lilith]    工具数量: {len(LANGCHAIN_TOOLS)}")
     print(f"[Lilith]    记忆库: {DB_PATH}")
     print(f"[Lilith]")
